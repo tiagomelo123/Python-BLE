@@ -1,0 +1,172 @@
+
+---
+
+## 2️⃣ Versão em HTML (opcional)
+
+Se você quiser uma página HTML (por exemplo para GitHub Pages ou para abrir localmente), pode criar um arquivo `docs/index.html` com algo assim (é basicamente o README, só que em HTML simples):
+
+```html
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <title>Python-BLE – Raspberry Pi BLE File Receiver</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 24px;
+      max-width: 960px;
+      margin-inline: auto;
+      line-height: 1.6;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+    h1, h2, h3 {
+      color: #38bdf8;
+    }
+    code {
+      background: #020617;
+      padding: 2px 4px;
+      border-radius: 4px;
+      font-family: "Fira Code", monospace;
+      font-size: 0.95em;
+    }
+    pre {
+      background: #020617;
+      padding: 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+    }
+    a {
+      color: #38bdf8;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid #1f2937;
+      padding: 6px 8px;
+      text-align: left;
+    }
+    th {
+      background: #111827;
+    }
+    .tag {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: #0f766e;
+      font-size: 0.8em;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Python-BLE – Raspberry Pi BLE File Receiver</h1>
+
+<p>Script em Python para transformar um <strong>Raspberry Pi</strong> em um periférico <strong>BLE (Bluetooth Low Energy)</strong> que recebe arquivos enviados por um aplicativo móvel, usando um protocolo simples baseado no <strong>Nordic UART Service (NUS)</strong>.</p>
+
+<p>Repositório: <a href="https://github.com/tiagomelo123/Python-BLE" target="_blank">https://github.com/tiagomelo123/Python-BLE</a></p>
+
+<h2>🚀 Visão Geral</h2>
+<p>Este projeto expõe um <strong>GATT Server BLE</strong> no Raspberry Pi, capaz de anunciar-se, aceitar pareamento Just Works e receber arquivos binários enviados por um app.</p>
+
+<h2>📁 Estrutura do Repositório</h2>
+<pre><code>Python-BLE/
+├─ bt_ble_file.py            # Script principal BLE (servidor no Raspberry Pi)
+├─ requirements.txt          # Dependências Python
+├─ README.md                 # Documentação principal
+└─ docs/
+   ├─ protocolo.md           # Detalhes do protocolo file_begin/file_end
+   └─ screenshots/           # Logs, prints de terminal, etc.
+</code></pre>
+
+<h2>⚙️ Requisitos</h2>
+<h3>Hardware</h3>
+<ul>
+  <li>Raspberry Pi 3 ou superior com Bluetooth integrado, ou adaptador compatível.</li>
+</ul>
+
+<h3>Software</h3>
+<ul>
+  <li>Linux com BlueZ e D-Bus configurados;</li>
+  <li>Python 3.8+;</li>
+  <li>Dependência Python: <code>dbus-next</code></li>
+</ul>
+
+<pre><code>pip install dbus-next</code></pre>
+
+<h2>▶️ Instalação e Execução</h2>
+<pre><code>git clone https://github.com/tiagomelo123/Python-BLE.git
+cd Python-BLE
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+sudo -E python3 bt_ble_file.py
+</code></pre>
+
+<h2>🎛 Controles de Teclado</h2>
+<table>
+  <thead>
+    <tr><th>Tecla</th><th>Ação</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>a</code></td><td>Iniciar advertising BLE</td></tr>
+    <tr><td><code>s</code></td><td>Parar advertising</td></tr>
+    <tr><td><code>e</code></td><td>Alternar modo "receber arquivo" ON/OFF</td></tr>
+    <tr><td><code>v</code></td><td>Mostrar o caminho do último arquivo salvo</td></tr>
+    <tr><td><code>q</code></td><td>Encerrar o programa</td></tr>
+  </tbody>
+</table>
+
+<h2>📡 Protocolo de Comunicação</h2>
+<p>O app envia comandos JSON e bytes binários pela característica RX do serviço UART BLE.</p>
+
+<pre><code>{
+  "op": "file_begin",
+  "name": "foto_teste.jpg",
+  "size": 113436
+}
+...
+{ "op": "file_end" }
+</code></pre>
+
+<h2>📘 Estrutura do Código e Funções (bt_ble_file.py)</h2>
+
+<p><span class="tag">Classe</span> <strong>KeyReader</strong> – lê teclas no terminal em modo não bloqueante.</p>
+<p><span class="tag">Classe</span> <strong>NoIOAgent</strong> – implementa agente de pareamento "NoInputNoOutput" (Just Works).</p>
+<p><span class="tag">Classe</span> <strong>GattCharacteristic</strong> – representa uma característica GATT (RX/TX).</p>
+<p><span class="tag">Classe</span> <strong>GattService</strong> – grupo de características; serviço UART BLE.</p>
+<p><span class="tag">Classe</span> <strong>LEAdvertisement</strong> – define advertising BLE (nome, UUID, tipo).</p>
+<p><span class="tag">Classe</span> <strong>BLEApp</strong> – núcleo da aplicação: D-Bus, Agent, GATT, advertising e protocolo de arquivos.</p>
+
+<h2>🧠 Fluxo Resumido</h2>
+<pre><code>[App Mobile] ─ file_begin JSON
+        │
+        ├─ bytes binários (chunks)
+        │
+        └─ file_end JSON
+             │
+             └─ [bt_ble_file.py] → salva em ./downloads/&lt;arquivo&gt;
+</code></pre>
+
+<h2>💡 Ideias Futuras</h2>
+<ul>
+  <li>Medição de taxa de transferência (KB/s).</li>
+  <li>ACK via TX (Notify).</li>
+  <li>Checksum (SHA-256) para integridade.</li>
+  <li>Criptografia opcional (Fernet).</li>
+</ul>
+
+<h2>👤 Autor</h2>
+<p><strong>Tiago de Melo</strong><br/>
+Repositório: <a href="https://github.com/tiagomelo123/Python-BLE" target="_blank">https://github.com/tiagomelo123/Python-BLE</a></p>
+
+</body>
+</html>
