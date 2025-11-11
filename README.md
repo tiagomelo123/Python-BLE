@@ -53,4 +53,3 @@ Clone o repositório:
 
 ```bash
 git clone https://github.com/tiagomelo123/Python-BLE.git
-cd bt-ble-file
