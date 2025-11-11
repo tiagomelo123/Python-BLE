@@ -52,5 +52,5 @@ A comunicação é feita assim:
 Clone o repositório:
 
 ```bash
-git clone https://github.com/seu-usuario/bt-ble-file.git
+git clone https://github.com/tiagomelo123/Python-BLE.git
 cd bt-ble-file
