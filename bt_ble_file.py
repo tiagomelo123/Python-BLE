@@ -2,13 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-BLE File Receiver + Controls
-- Nordic UART Service (RX write, TX notify)
-- Start/Stop Advertising
-- Discoverable ON/OFF
-- Pairable ON/OFF
-- Agent NoInputNoOutput (pareamento automático)
-- Recebimento de arquivo via JSON (file_begin/file_chunk/file_end)
+Raspberry Pi 3 - BLE periférico com controle por teclado + pareamento silencioso
+- GATT Server (serviço estilo Nordic UART: RX=Write, TX=Notify)
+- LE Advertising start/stop via teclado
+- Adapter Discoverable/Pairable toggles
+- Agent NoInputNoOutput (pareamento silencioso/Just Works)
+- Modo de recebimento de arquivo via JSON:
+    { "op":"file_begin","name":"arquivo.ext","size":1234 }
+    <dados binários puros em vários writes>
+    { "op":"file_end" }
+Execute como root: sudo -E python3 bt_ble_file.py
 """
 
 import asyncio
@@ -27,9 +30,6 @@ from dbus_next.service import ServiceInterface, method, dbus_property
 from dbus_next.constants import PropertyAccess, BusType
 from dbus_next import Variant
 
-# ==============================
-# BlueZ constants
-# ==============================
 BLUEZ = "org.bluez"
 OBJMGR_IFACE = "org.freedesktop.DBus.ObjectManager"
 PROPS_IFACE = "org.freedesktop.DBus.Properties"
@@ -43,17 +43,14 @@ APP_ROOT = "/tiago/gatt"
 ADV_PATH = "/tiago/adv0"
 ADAPTER_FALLBACK = "/org/bluez/hci0"
 
-# Nordic UART Service
+# Serviço estilo "Nordic UART"
 NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-NUS_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
-NUS_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+NUS_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Write, WriteWithoutResponse
+NUS_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # Notify (Read opcional)
 
 DOWNLOAD_DIR = os.path.abspath("./downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ==============================
-# Key Reader
-# ==============================
+# ---------- Util: leitura de 1 tecla sem bloquear ----------
 class KeyReader:
     def __init__(self):
         self._fd = sys.stdin.fileno()
@@ -63,419 +60,454 @@ class KeyReader:
     def restore(self):
         termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
 
-# ==============================
-# Agent NoInputNoOutput
-# ==============================
+
+# ---------- Agent silencioso (pareamento Just Works) ----------
 class NoIOAgent(ServiceInterface):
     def __init__(self):
         super().__init__("org.bluez.Agent1")
 
-    @method() def Release(self): pass
-    @method() def RequestConfirmation(self, device:'o', passkey:'u'): pass
-    @method() def RequestAuthorization(self, device:'o'): pass
-    @method() def AuthorizeService(self, device:'o', uuid:'s'): pass
-    @method() def Cancel(self): pass
+    @method()
+    def Release(self) -> None:
+        return
 
-    @method() 
-    def RequestPinCode(self, device:'o') -> 's':
+    @method()
+    def RequestConfirmation(self, device: 'o', passkey: 'u') -> None:
+        return
+
+    @method()
+    def RequestAuthorization(self, device: 'o') -> None:
+        return
+
+    @method()
+    def AuthorizeService(self, device: 'o', uuid: 's') -> None:
+        return
+
+    @method()
+    def Cancel(self) -> None:
+        return
+
+    @method()
+    def RequestPinCode(self, device: 'o') -> 's':
         raise Exception("org.bluez.Error.Rejected")
 
-    @method() 
-    def RequestPasskey(self, device:'o') -> 'u':
+    @method()
+    def DisplayPinCode(self, device: 'o', pincode: 's') -> None:
+        return
+
+    @method()
+    def RequestPasskey(self, device: 'o') -> 'u':
         raise Exception("org.bluez.Error.Rejected")
 
-    @method() 
-    def DisplayPasskey(self, device:'o', passkey:'u', entered:'q'): pass
+    @method()
+    def DisplayPasskey(self, device: 'o', passkey: 'u', entered: 'q') -> None:
+        return
 
-    @method() 
-    def DisplayPinCode(self, device:'o', pincode:'s'): pass
 
-# ==============================
-# GATT Characteristic
-# ==============================
+# ---------- GATT: Característica ----------
 class GattCharacteristic(ServiceInterface):
-    def __init__(self, uuid, flags, service_path):
+    def __init__(self, uuid: str, flags: List[str], service_path: str):
         super().__init__("org.bluez.GattCharacteristic1")
         self.uuid = uuid
         self.flags = flags
         self.service_path = service_path
-        self._value = b""
+        self._value = bytes()
         self._notifying = False
         self.received_cb = None
 
     @dbus_property(access=PropertyAccess.READ)
-    def UUID(self): return self.uuid
+    def UUID(self) -> 's':
+        return self.uuid
 
     @dbus_property(access=PropertyAccess.READ)
-    def Service(self): return self.service_path
+    def Service(self) -> 'o':
+        return self.service_path
 
     @dbus_property(access=PropertyAccess.READ)
-    def Flags(self): return self.flags
+    def Flags(self) -> 'as':
+        return self.flags
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Value(self) -> 'ay':
+        return self._value
 
     @method()
-    def ReadValue(self, options): return self._value
+    def ReadValue(self, options: 'a{sv}') -> 'ay':
+        return self._value
 
     @method()
-    def WriteValue(self, value, options):
+    def WriteValue(self, value: 'ay', options: 'a{sv}') -> None:
         incoming = bytes(value)
         self._value = incoming
-
-        # Log curto
-        try: txt = incoming.decode("utf-8", errors="replace")
-        except: txt = ""
-        print(f"[RX] {len(incoming)} bytes | {txt[:80]!r}")
-
-        # envia ao processamento
+        try:
+            as_text = self._value.decode("utf-8", errors="replace")
+        except Exception:
+            as_text = ""
+        print(f"[RX/WriteValue] len={len(incoming)} | {self.uuid} | {as_text[:80]!r}")
         if self.received_cb:
             try:
+                # trata cada quadro separadamente
                 self.received_cb(incoming)
             except Exception as e:
-                print("[RX CALLBACK ERROR]", e)
+                print(f"[RX/Callback ERR] {e}")
 
     @method()
-    def StartNotify(self): self._notifying = True
+    def StartNotify(self) -> None:
+        self._notifying = True
 
     @method()
-    def StopNotify(self): self._notifying = False
+    def StopNotify(self) -> None:
+        self._notifying = False
 
-    def notify(self, data:bytes):
+    def notify(self, data: bytes):
         self._value = data or b""
         if self._notifying:
             self.emit_properties_changed({"Value": self._value}, [])
 
-# ==============================
-# GATT Service
-# ==============================
+
+# ---------- Serviço ----------
 class GattService(ServiceInterface):
-    def __init__(self, uuid, primary, path):
+    def __init__(self, uuid: str, primary: bool, path: str):
         super().__init__("org.bluez.GattService1")
         self.uuid = uuid
         self.primary = primary
         self.path = path
 
     @dbus_property(access=PropertyAccess.READ)
-    def UUID(self): return self.uuid
+    def UUID(self) -> 's':
+        return self.uuid
 
     @dbus_property(access=PropertyAccess.READ)
-    def Primary(self): return self.primary
+    def Primary(self) -> 'b':
+        return self.primary
 
-# ==============================
-# Advertisement
-# ==============================
+
+# ---------- LE Advertisement ----------
 class LEAdvertisement(ServiceInterface):
-    def __init__(self, name, uuids):
+    def __init__(self, local_name: str, service_uuids: List[str]):
         super().__init__("org.bluez.LEAdvertisement1")
-        self.name = name
-        self.uuids = uuids
+        self.local_name = local_name
+        self.service_uuids = service_uuids
 
     @dbus_property(access=PropertyAccess.READ)
-    def Type(self): return "peripheral"
+    def Type(self) -> 's':
+        return "peripheral"
 
     @dbus_property(access=PropertyAccess.READ)
-    def LocalName(self): return self.name
+    def LocalName(self) -> 's':
+        return self.local_name
 
     @dbus_property(access=PropertyAccess.READ)
-    def ServiceUUIDs(self): return self.uuids
+    def ServiceUUIDs(self) -> 'as':
+        return self.service_uuids
 
     @dbus_property(access=PropertyAccess.READ)
-    def ManufacturerData(self): return {}
+    def TxPower(self) -> 'n':
+        return 0
 
     @dbus_property(access=PropertyAccess.READ)
-    def ServiceData(self): return {}
+    def ManufacturerData(self) -> 'a{qv}':
+        return {}
 
     @dbus_property(access=PropertyAccess.READ)
-    def TxPower(self): return 0
+    def ServiceData(self) -> 'a{sv}':
+        return {}
 
     @method()
-    def Release(self): pass
+    def Release(self) -> None:
+        return
 
-# ==============================
-# Helpers
-# ==============================
-def _safe_filename(name):
-    name = os.path.basename(name.strip().replace("\x00",""))
+
+def _safe_filename(name: str) -> str:
+    # só tira barras e null, o resto mantém
+    name = os.path.basename(name).strip().replace("\x00", "")
     return name or "arquivo.bin"
 
-# ==============================
-# BLE App
-# ==============================
+
+# ---------- App ----------
 class BLEApp:
     def __init__(self):
-        self.bus = None
-        self.adapter = None
+        self.bus: MessageBus | None = None
+        self.adapter_path = None
         self.props_iface = None
-        self.rx_char = None
-        self.tx_char = None
+        self.service = None
+        self.rx_char: GattCharacteristic | None = None
+        self.tx_char: GattCharacteristic | None = None
         self.adv = None
         self.advertising = False
 
-        # File transfer
+        self.rx_buffer = deque(maxlen=1000)
+
+        # recebimento de arquivo
         self.recv_enabled = True
         self.recv_active = False
         self.recv_name = None
         self.recv_size = 0
-        self.recv_bytes = None
+        self.recv_bytes: bytearray | None = None
         self.recv_chunks = 0
-        self.recv_t0 = 0
-        self.recv_last_saved = None
+        self.recv_t0 = 0.0
+        self.recv_last_saved_path = None
 
         self._shutdown = asyncio.Event()
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-    # ------------------------------
-    # DBus
-    # ------------------------------
-    async def connect(self):
+    # ----- DBus / Adapter -----
+    async def connect_bus(self):
         self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
-    async def resolve_adapter(self):
+    async def get_managed_objects(self):
         obj = await self.bus.introspect(BLUEZ, "/")
         mgr = self.bus.get_proxy_object(BLUEZ, "/", obj).get_interface(OBJMGR_IFACE)
-        objs = await mgr.call_get_managed_objects()
+        return await mgr.call_get_managed_objects()
 
-        for path, ifs in objs.items():
-            if ADAPTER_IFACE in ifs:
-                self.adapter = path
+    async def resolve_adapter(self):
+        objs = await self.get_managed_objects()
+        for path, ifaces in objs.items():
+            if ADAPTER_IFACE in ifaces:
+                self.adapter_path = path
                 break
-
-        if not self.adapter:
-            self.adapter = ADAPTER_FALLBACK
-
-        aobj = await self.bus.introspect(BLUEZ, self.adapter)
-        pobj = self.bus.get_proxy_object(BLUEZ, self.adapter, aobj)
+        if not self.adapter_path:
+            self.adapter_path = ADAPTER_FALLBACK
+        aobj = await self.bus.introspect(BLUEZ, self.adapter_path)
+        pobj = self.bus.get_proxy_object(BLUEZ, self.adapter_path, aobj)
         self.props_iface = pobj.get_interface(PROPS_IFACE)
 
-    # ------------------------------
-    # Adapter Controls
-    # ------------------------------
+    # ----- Adapter props (Discoverable / Pairable) -----
+    async def set_adapter_prop(self, iface: str, prop: str, variant: Variant):
+        await self.props_iface.call_set(iface, prop, variant)
+
     async def discoverable_on(self):
-        await self.props_iface.call_set(ADAPTER_IFACE,"Discoverable",Variant("b",True))
-        print("[ADAPTER] Discoverable ON")
+        await self.set_adapter_prop(ADAPTER_IFACE, "Discoverable", Variant("b", True))
 
     async def discoverable_off(self):
-        await self.props_iface.call_set(ADAPTER_IFACE,"Discoverable",Variant("b",False))
-        print("[ADAPTER] Discoverable OFF")
+        await self.set_adapter_prop(ADAPTER_IFACE, "Discoverable", Variant("b", False))
 
     async def pairable_on(self):
-        await self.props_iface.call_set(ADAPTER_IFACE,"Pairable",Variant("b",True))
-        print("[ADAPTER] Pairable ON")
+        await self.set_adapter_prop(ADAPTER_IFACE, "Pairable", Variant("b", True))
 
     async def pairable_off(self):
-        await self.props_iface.call_set(ADAPTER_IFACE,"Pairable",Variant("b",False))
-        print("[ADAPTER] Pairable OFF")
+        await self.set_adapter_prop(ADAPTER_IFACE, "Pairable", Variant("b", False))
 
-    # ------------------------------
-    # Agent
-    # ------------------------------
+    # ----- Agent -----
     async def register_agent(self):
         agent = NoIOAgent()
         self.bus.export(AGENT_PATH, agent)
         obj = await self.bus.introspect(BLUEZ, "/org/bluez")
-        mgr = self.bus.get_proxy_object(BLUEZ,"/org/bluez", obj).get_interface(AGENT_MGR_IFACE)
-        await mgr.call_register_agent(AGENT_PATH,"NoInputNoOutput")
+        mgr = self.bus.get_proxy_object(BLUEZ, "/org/bluez", obj).get_interface(AGENT_MGR_IFACE)
+        await mgr.call_register_agent(AGENT_PATH, "NoInputNoOutput")
         await mgr.call_request_default_agent(AGENT_PATH)
-        print("[AGENT] Agent NoInputNoOutput registrado.")
+        print("[AGENT] Agente NoInputNoOutput registrado como padrão.")
 
-    # ------------------------------
-    # GATT Setup
-    # ------------------------------
+    # ----- GATT -----
     async def register_gatt(self):
-        # service
-        srv_path = f"{APP_ROOT}/service0"
-        service = GattService(NUS_SERVICE_UUID, True, srv_path)
-        self.bus.export(srv_path, service)
+        self.service = GattService(NUS_SERVICE_UUID, True, f"{APP_ROOT}/service0")
+        self.bus.export(f"{APP_ROOT}/service0", self.service)
 
-        # RX
-        rx_path = f"{srv_path}/rx"
-        self.rx_char = GattCharacteristic(NUS_RX_CHAR_UUID,
-                                          ["write","write-without-response"],
-                                          srv_path)
-        self.rx_char.received_cb = self.on_rx
-        self.bus.export(rx_path, self.rx_char)
+        self.rx_char = GattCharacteristic(
+            NUS_RX_CHAR_UUID,
+            ["write", "write-without-response"],
+            f"{APP_ROOT}/service0",
+        )
+        self.rx_char.received_cb = self._on_rx
+        self.bus.export(f"{APP_ROOT}/service0/char0", self.rx_char)
 
-        # TX
-        tx_path = f"{srv_path}/tx"
-        self.tx_char = GattCharacteristic(NUS_TX_CHAR_UUID, ["notify","read"], srv_path)
-        self.bus.export(tx_path, self.tx_char)
+        self.tx_char = GattCharacteristic(
+            NUS_TX_CHAR_UUID,
+            ["notify", "read"],
+            f"{APP_ROOT}/service0",
+        )
+        self.bus.export(f"{APP_ROOT}/service0/char1", self.tx_char)
 
-        # register
-        aobj = await self.bus.introspect(BLUEZ, self.adapter)
-        gatt = self.bus.get_proxy_object(BLUEZ, self.adapter, aobj).get_interface(GATT_MANAGER_IFACE)
-        await gatt.call_register_application(APP_ROOT, {})
+        aobj = await self.bus.introspect(BLUEZ, self.adapter_path)
+        gatt_mgr = self.bus.get_proxy_object(BLUEZ, self.adapter_path, aobj).get_interface(GATT_MANAGER_IFACE)
+        await gatt_mgr.call_register_application(APP_ROOT, {})
         print("[GATT] Serviço NUS registrado.")
 
-    # ------------------------------
-    # Advertisement
-    # ------------------------------
-    async def start_advertising(self):
-        if self.advertising:
-            print("[ADV] Já anunciando.")
-            return
-        self.adv = LEAdvertisement("Pi-BLE-UART",[NUS_SERVICE_UUID])
-        self.bus.export(ADV_PATH, self.adv)
-
-        aobj = await self.bus.introspect(BLUEZ, self.adapter)
-        adv_mgr = self.bus.get_proxy_object(BLUEZ, self.adapter, aobj).get_interface(LE_ADV_MGR_IFACE)
-        await adv_mgr.call_register_advertisement(ADV_PATH,{})
-        self.advertising = True
-        print("[ADV] Advertising iniciado.")
-
-    async def stop_advertising(self):
-        if not self.advertising:
-            return
-        aobj = await self.bus.introspect(BLUEZ, self.adapter)
-        adv_mgr = self.bus.get_proxy_object(BLUEZ,self.adapter,aobj).get_interface(LE_ADV_MGR_IFACE)
-        await adv_mgr.call_unregister_advertisement(ADV_PATH)
-        self.bus.unexport(ADV_PATH, self.adv)
-        self.advertising = False
-        print("[ADV] Advertising parado.")
-
-    # ------------------------------
-    # TX notify
-    # ------------------------------
-    async def send_tx(self, text:str):
+    async def notify_tx(self, payload: bytes):
         if not self.tx_char:
-            print("[TX] TX indisponível")
+            print("[TX] Característica TX indisponível.")
             return
-        data = text.encode()
-        self.tx_char.notify(data)
-        print("[TX]", data)
+        self.tx_char.notify(payload)
+        print(f"[TX] Notificado: {payload!r}")
 
-    # ------------------------------
-    # RX Handler (file receive)
-    # ------------------------------
-    def on_rx(self,data:bytes):
-        # tenta JSON
+    # ----- RX -----
+    def _on_rx(self, data: bytes):
+        self.rx_buffer.append(data)
+
+        # tenta JSON (controle)
         try:
-            txt = data.decode("utf-8")
-            payload = json.loads(txt)
+            text = data.decode("utf-8")
+            payload = json.loads(text)
             op = (payload.get("op") or "").lower()
-        except:
+        except Exception:
             op = None
 
-        # ---------------- begin
+        # 1) Controle de arquivo
         if op == "file_begin":
             if not self.recv_enabled:
-                print("[FILE] Recebimento OFF")
                 return
-
             self.recv_active = True
-            self.recv_name = _safe_filename(payload.get("name","arquivo.bin"))
-            self.recv_size = int(payload.get("size",0))
+            self.recv_name = _safe_filename(payload.get("name", "arquivo.bin"))
+            self.recv_size = int(payload.get("size", 0))
             self.recv_bytes = bytearray()
             self.recv_chunks = 0
             self.recv_t0 = time.perf_counter()
             print(f"[FILE] BEGIN '{self.recv_name}' size={self.recv_size}")
             return
 
-        # ---------------- chunk
-        elif op == "file_chunk":
-            if not (self.recv_active and self.recv_bytes is not None):
-                return
-
-            b64 = payload.get("b64") or payload.get("data")
-            if not isinstance(b64,str):
-                return
-
-            try:
-                chunk = base64.b64decode(b64)
-                self.recv_bytes.extend(chunk)
-                self.recv_chunks += 1
-            except Exception as e:
-                print("[FILE] erro chunk:", e)
-            return
-
-        # ---------------- end
         elif op == "file_end":
-            if not (self.recv_active and self.recv_bytes):
-                print("[FILE] file_end sem dados")
+            if not (self.recv_enabled and self.recv_active and self.recv_bytes is not None):
+                print("[FILE] file_end ignorado (sem begin).")
                 return
 
-            elapsed = (time.perf_counter()-self.recv_t0)*1000
-            path = os.path.join(DOWNLOAD_DIR, self.recv_name)
+            elapsed = (time.perf_counter() - self.recv_t0) * 1000.0
+            path = os.path.join(DOWNLOAD_DIR, self.recv_name or "arquivo.bin")
 
-            with open(path,"wb") as f:
+            if len(self.recv_bytes) == 0:
+                print("[FILE] Nada recebido entre begin/end, abortando.")
+                self.recv_active = False
+                self.recv_name = None
+                self.recv_bytes = None
+                return
+
+            with open(path, "wb") as f:
                 f.write(self.recv_bytes)
 
             print(f"[FILE] END saved={len(self.recv_bytes)} bytes path={path}")
             print(f"[FILE] STATS chunks={self.recv_chunks} elapsed_ms={elapsed:.0f}")
-            self.recv_last_saved = path
+            self.recv_last_saved_path = path
 
-            # reset
             self.recv_active = False
             self.recv_name = None
             self.recv_bytes = None
             return
 
-        # ---------------- se não for JSON → ignora
-        else:
+        # 2) Dados binários (quando estamos em modo de arquivo)
+        if not (self.recv_active and self.recv_bytes is not None):
+            # se não estamos recebendo arquivo, apenas log leve
             return
 
-    # ------------------------------
-    # Key handler
-    # ------------------------------
-    async def handle_key(self,ch):
-        ch = ch.strip().lower()
-        if ch=="a": await self.start_advertising()
-        elif ch=="s": await self.stop_advertising()
-        elif ch=="d": await self.discoverable_on()
-        elif ch=="f": await self.discoverable_off()
-        elif ch=="p": await self.pairable_on()
-        elif ch=="o": await self.pairable_off()
-        elif ch=="t": await self.send_tx("Hello from Pi")
-        elif ch=="v": print("[FILE] Último salvo:", self.recv_last_saved or "-")
-        elif ch=="e":
-            self.recv_enabled = not self.recv_enabled
-            print("[FILE] Receber arquivo:", "ON" if self.recv_enabled else "OFF")
-        elif ch=="q":
-            print("[SYS] Encerrando…")
-            self._shutdown.set()
+        raw = bytes(data)
+        if not raw:
+            return
 
-    # ------------------------------
-    # Loop principal
-    # ------------------------------
+        self.recv_bytes.extend(raw)
+        self.recv_chunks += 1
+
+        if self.recv_chunks % 100 == 0:
+            print(f"[FILE] chunk #{self.recv_chunks} · total {len(self.recv_bytes)} bytes")
+
+    # ----- Advertising -----
+    async def start_advertising(self):
+        if self.advertising:
+            print("[ADV] Já está anunciando.")
+            return
+        self.adv = LEAdvertisement("Pi-BLE-UART", [NUS_SERVICE_UUID])
+        self.bus.export(ADV_PATH, self.adv)
+        aobj = await self.bus.introspect(BLUEZ, self.adapter_path)
+        adv_mgr = self.bus.get_proxy_object(BLUEZ, self.adapter_path, aobj).get_interface(LE_ADV_MGR_IFACE)
+        await adv_mgr.call_register_advertisement(ADV_PATH, {})
+        self.advertising = True
+        print("[ADV] Advertising iniciado.")
+
+    async def stop_advertising(self):
+        if not self.advertising:
+            print("[ADV] Não está anunciando.")
+            return
+        aobj = await self.bus.introspect(BLUEZ, self.adapter_path)
+        adv_mgr = self.bus.get_proxy_object(BLUEZ, self.adapter_path, aobj).get_interface(LE_ADV_MGR_IFACE)
+        await adv_mgr.call_unregister_advertisement(ADV_PATH)
+        self.bus.unexport(ADV_PATH, self.adv)
+        self.advertising = False
+        print("[ADV] Advertising parado.")
+
+    # ----- Loop principal -----
     async def run(self):
-        await self.connect()
+        await self.connect_bus()
         await self.resolve_adapter()
         await self.register_agent()
         await self.register_gatt()
-        await self.start_advertising()
-        await self.pairable_on()
-        await self.discoverable_on()
-
+        await self.pairable_on()          # Pairable ON ao iniciar
+        await self.start_advertising()    # já começa anunciando
         print_controls()
 
         reader = KeyReader()
         loop = asyncio.get_running_loop()
 
-        loop.add_reader(reader._fd,
-            lambda: asyncio.create_task(self.handle_key(
-                os.read(reader._fd,1).decode(errors="ignore"))))
+        def on_stdin_byte():
+            try:
+                ch = os.read(reader._fd, 1).decode(errors="ignore")
+            except Exception:
+                ch = ""
+            if ch:
+                asyncio.create_task(self.handle_key(ch))
 
+        loop.add_reader(reader._fd, on_stdin_byte)
         await self._shutdown.wait()
         loop.remove_reader(reader._fd)
         reader.restore()
 
-# ==============================
-# Controls Text
-# ==============================
+    async def handle_key(self, ch: str):
+        ch = ch.strip().lower()
+        if ch == "a":
+            await self.start_advertising()
+        elif ch == "s":
+            await self.stop_advertising()
+        elif ch == "d":
+            await self.discoverable_on()
+            print("[ADAPTER] Discoverable=ON")
+        elif ch == "f":
+            await self.discoverable_off()
+            print("[ADAPTER] Discoverable=OFF")
+        elif ch == "p":
+            await self.pairable_on()
+            print("[ADAPTER] Pairable=ON")
+        elif ch == "o":
+            await self.pairable_off()
+            print("[ADAPTER] Pairable=OFF")
+        elif ch == "t":
+            await self.notify_tx(b"Hello from Pi")
+        elif ch == "y":
+            msg = input("Digite a mensagem para TX: ")
+            await self.notify_tx(msg.encode("utf-8", errors="replace"))
+        elif ch == "r":
+            print(f"[RX-BUFFER] {len(self.rx_buffer)} itens")
+            for i, b in enumerate(list(self.rx_buffer)[-20:], 1):
+                try:
+                    t = b.decode("utf-8", errors="replace")
+                except Exception:
+                    t = ""
+                print(f"  {i:02d}: {b!r} | '{t}'")
+        elif ch == "e":
+            self.recv_enabled = not self.recv_enabled
+            print(f"[FILE] Receber arquivo: {'ON' if self.recv_enabled else 'OFF'}")
+        elif ch == "v":
+            print(f"[FILE] Último salvo: {self.recv_last_saved_path or '-'}")
+        elif ch == "h":
+            print_controls()
+        elif ch == "q":
+            print("[SYS] Encerrando…")
+            self._shutdown.set()
+
+
 def print_controls():
     print("""
-[CONTROLES BLUETOOTH]
+[CONTROLES]
   a = Start Advertising (visível no BLE)
   s = Stop Advertising
   d = Adapter Discoverable ON
   f = Adapter Discoverable OFF
   p = Pairable ON
   o = Pairable OFF
-  t = Enviar notificação 'Hello from Pi'
-  e = Alternar receber arquivo ON/OFF
-  v = Mostrar último arquivo salvo
+  t = Enviar notificação 'Hello from Pi' na TX
+  y = Enviar texto livre pela TX
+  r = Mostrar últimos dados recebidos (RX)
+  e = Alternar 'receber arquivo' ON/OFF
+  v = Mostrar caminho do último arquivo salvo
+  h = Ajuda
   q = Sair
 """)
 
-# ==============================
-# MAIN
-# ==============================
+
 if __name__ == "__main__":
     try:
         asyncio.run(BLEApp().run())
